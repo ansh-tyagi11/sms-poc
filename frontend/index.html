@@ -15,7 +15,7 @@
 
         <h1>Bulk Campaign Tool</h1>
 
-        <form method="post">
+        <form id="campaignForm" method="post">
             <label>Upload Excel</label>
             <input type="file" id="excel" accept=".xlsx">
 
@@ -38,11 +38,15 @@
             </select>
 
 
-            <button type="submit" id="sendBtn">
+            <div class="button-row">
+                <button type="submit" id="sendBtn">
+                    Send Campaign
+                </button>
 
-                Send Campaign
-
-            </button>
+                <button type="button" id="stopBtn" disabled>
+                    Stop
+                </button>
+            </div>
         </form>
 
 

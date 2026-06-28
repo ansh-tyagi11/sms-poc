@@ -90,25 +90,41 @@ async function sendOne(user, messageBody) {
 
 }
 
-async function sendBulkMessages(users, messageBody) {
+function createCancellationState(req) {
+    const state = {
+        cancelled: false,
+        reason: 'The request was cancelled.'
+    };
 
-    // remove this later
-    const sample = users.slice(0, 50);
+    const markCancelled = () => {
+        state.cancelled = true;
+    };
 
-    // for production
-    // const sample = users;
+    req.on('aborted', markCancelled);
+    req.on('close', () => {
+        if (!req.complete) {
+            markCancelled();
+        }
+    });
 
+    return state;
+}
 
-    const promises = sample.map(user =>
+async function sendBulkMessages(users, messageBody, cancellationState) {
 
-        limit(() =>
-            sendOne(user, messageBody)
-        )
+    const tasks = users.map(user =>
+        limit(async () => {
+            if (cancellationState.cancelled) {
+                return null;
+            }
+
+            return sendOne(user, messageBody);
+        })
     );
 
-    const results = await Promise.all(promises);
+    const results = await Promise.all(tasks);
 
-    return results;
+    return results.filter(Boolean);
 }
 
 app.get('/', (_req, res) => {
@@ -131,8 +147,14 @@ app.post('/send-message', upload.single('file'), async (req, res, next) => {
             });
         }
 
+        const cancellationState = createCancellationState(req);
         const users = readContactsFromBuffer(req.file.buffer);
-        const results = await sendBulkMessages(users, messageBody);
+        const results = await sendBulkMessages(users, messageBody, cancellationState);
+
+        if (cancellationState.cancelled) {
+            return;
+        }
+
         const sentCount = results.filter(result => result.sid).length;
         const failedCount = results.length - sentCount;
 
@@ -144,6 +166,9 @@ app.post('/send-message', upload.single('file'), async (req, res, next) => {
             results
         });
     } catch (error) {
+        if (error.code === 'ERR_HTTP_REQUEST_ABORTED') {
+            return;
+        }
         next(error);
     }
 });

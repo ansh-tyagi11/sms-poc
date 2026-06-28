@@ -1,8 +1,25 @@
-const btn = document.getElementById('sendBtn');
+const form = document.getElementById('campaignForm');
+const sendBtn = document.getElementById('sendBtn');
+const stopBtn = document.getElementById('stopBtn');
+const status = document.getElementById('status');
 
-btn.addEventListener('click', sendMessage);
+let activeController = null;
 
-function sendMessage(e) {
+form.addEventListener('submit', sendMessage);
+stopBtn.addEventListener('click', stopMessage);
+
+function setSendingState(isSending) {
+    sendBtn.disabled = isSending;
+    stopBtn.disabled = !isSending;
+}
+
+function stopMessage() {
+    if (activeController) {
+        activeController.abort();
+    }
+}
+
+async function sendMessage(e) {
     e.preventDefault();
     const file =
         document.getElementById('excel').files[0];
@@ -10,8 +27,6 @@ function sendMessage(e) {
         document.getElementById('message').value;
     const channel =
         document.getElementById('channel').value;
-    const status
-        = document.getElementById('status');
 
 
     const formData = new FormData();
@@ -20,27 +35,42 @@ function sendMessage(e) {
         return;
     }
 
+    if (activeController) {
+        activeController.abort();
+    }
+
+    activeController = new AbortController();
+    setSendingState(true);
+    status.innerHTML = '<p>Sending campaign...</p>';
+
     formData.append('file', file);
     formData.append('message', message);
     formData.append('channel', channel);
 
-    for (let pair of formData.entries()) {
-        console.log(pair[0], pair[1]);
-    }
+    try {
+        const response = await fetch(`/send-message`, {
+            method: 'POST',
+            body: formData,
+            signal: activeController.signal
+        });
 
-    let res = fetch('http://localhost:4000/send-message', {
-        method: 'POST',
-        body: formData
-    }).then(response => response.json())
-        .then(data => {
-            console.log(data);
-            // alert(data.message);
-            status.innerHTML = `
-                <p>Total Contacts: ${data.total}</p>
-                <p>Messages Sent: ${data.sent}</p>
-                <p>Messages Failed: ${data.failed}</p>
-            `;
+        const data = await response.json();
+        status.innerHTML = `
+            <p>${data.message}</p>
+            <p>Total Contacts: ${data.total}</p>
+            <p>Messages Sent: ${data.sent}</p>
+            <p>Messages Failed: ${data.failed}</p>
+        `;
+        form.reset();
 
+    } catch (error) {
+        if (error.name === 'AbortError') {
+            status.innerHTML = '<p>Campaign stopped.</p>';
+        } else {
+            status.innerHTML = `<p>Failed to send campaign: ${error.message}</p>`;
         }
-        )
+    } finally {
+        activeController = null;
+        setSendingState(false);
+    }
 }

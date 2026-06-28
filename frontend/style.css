@@ -31,6 +31,24 @@ button {
     cursor: pointer;
 }
 
+.button-row {
+    display: flex;
+    gap: 12px;
+}
+
+.button-row button {
+    width: 50%;
+}
+
+.button-row button:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+}
+
+#stopBtn {
+    background: #8b1e1e;
+}
+
 
 
 .status {
