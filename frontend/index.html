@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="style.css">
+    <title>Twilio SMS</title>
+</head>
+
+<body>
+
+
+    <div class="container">
+
+        <h1>Bulk Campaign Tool</h1>
+
+        <form method="post">
+            <label>Upload Excel</label>
+            <input type="file" id="excel" accept=".xlsx">
+
+
+            <label>Message</label>
+
+            <textarea id="message" placeholder="Enter your message"></textarea>
+
+
+            <label>Channel</label>
+
+            <select id="channel">
+
+                <option>SMS</option>
+
+                <option>WhatsApp</option>
+
+                <option>Both</option>
+
+            </select>
+
+
+            <button type="submit" id="sendBtn">
+
+                Send Campaign
+
+            </button>
+        </form>
+
+
+        <h3>Campaign Status</h3>
+        
+        <div id="status" class="status">
+
+        </div>
+
+    </div>
+
+
+
+    <script src="script.js"></script>
+
+</body>
+
+</html>
