@@ -12,11 +12,14 @@ const PORT = Number(process.env.PORT) || 4000;
 const FRONTEND_DIR = path.join(__dirname, '..', 'frontend');
 const DEFAULT_MESSAGE = 'Test campaign';
 const MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024;
+const MAX_BODY_SIZE = '100kb';
+const CONCURRENCY_LIMIT = 20;
+const VALID_CHANNELS = new Set(['sms', 'whatsapp', 'both']);
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
 const ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || process.env.ACCOUNT_SID;
 const AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || process.env.AUTH_TOKEN;
 const SERVICE_SID = process.env.SERVICE_SID;
-const limit = pLimit(20);
 
 if (!ACCOUNT_SID || !AUTH_TOKEN || !SERVICE_SID) {
     throw new Error(
@@ -26,7 +29,7 @@ if (!ACCOUNT_SID || !AUTH_TOKEN || !SERVICE_SID) {
 }
 
 const client = twilio(ACCOUNT_SID, AUTH_TOKEN);
-
+const limit = pLimit(CONCURRENCY_LIMIT);
 const upload = multer({
     storage: multer.memoryStorage(),
     limits: {
@@ -35,9 +38,34 @@ const upload = multer({
 });
 
 app.disable('x-powered-by');
-app.use(express.json());
-app.use(express.urlencoded({ extended: false }));
-app.use(express.static(FRONTEND_DIR));
+app.set('trust proxy', 1);
+app.use(express.json({ limit: MAX_BODY_SIZE }));
+app.use(express.urlencoded({ extended: false, limit: MAX_BODY_SIZE }));
+app.use(express.static(FRONTEND_DIR, { extensions: ['html'] }));
+
+function normalizeChannel(channel) {
+    const normalized = String(channel || 'sms').trim().toLowerCase();
+
+    if (!VALID_CHANNELS.has(normalized)) {
+        throw new Error('Channel must be one of SMS, WhatsApp, or Both.');
+    }
+
+    return normalized;
+}
+
+function normalizeContactValue(value) {
+    return String(value || '').trim();
+}
+
+function pickRowValue(row, keys) {
+    for (const key of keys) {
+        if (row[key] !== undefined && row[key] !== null && String(row[key]).trim() !== '') {
+            return row[key];
+        }
+    }
+
+    return '';
+}
 
 function readContactsFromBuffer(buffer) {
     const workbook = XLSX.read(buffer, { type: 'buffer' });
@@ -55,45 +83,60 @@ function readContactsFromBuffer(buffer) {
         throw new Error('The uploaded Excel sheet does not contain any rows.');
     }
 
-    return rows;
+    return rows.map(row => ({
+        NAME: normalizeContactValue(pickRowValue(row, ['NAME', 'Name', 'name'])) || 'Unknown',
+        CONTACT: normalizeContactValue(pickRowValue(row, ['CONTACT', 'Contact', 'contact', 'PHONE', 'Phone', 'phone', 'MOBILE', 'Mobile', 'mobile']))
+    }));
 }
 
-async function sendOne(user, messageBody) {
+function buildRecipientAddress(rawContact, channel) {
+    const contact = normalizeContactValue(rawContact);
+    const hasWhatsAppPrefix = /^whatsapp:/i.test(contact);
 
+    if (!contact) {
+        throw new Error('Contact number is missing.');
+    }
+
+    if (channel === 'whatsapp') {
+        return hasWhatsAppPrefix ? contact : `whatsapp:${contact}`;
+    }
+
+    return hasWhatsAppPrefix ? contact.replace(/^whatsapp:/i, '') : contact;
+}
+
+async function sendOne(user, messageBody, channel) {
     const name = user.NAME || 'Unknown';
     const rawContact = user.CONTACT;
 
     try {
+        const recipient = buildRecipientAddress(rawContact, channel);
 
         const message = await client.messages.create({
             body: messageBody,
-            messagingServiceSid:
-                SERVICE_SID,
-            to: rawContact
+            messagingServiceSid: SERVICE_SID,
+            to: recipient
         });
 
         return {
             name,
             contact: rawContact,
+            channel,
             sid: message.sid,
             status: message.status
         };
-    }
-
-    catch (error) {
+    } catch (error) {
         return {
             name,
             contact: rawContact,
+            channel,
             error: error.message
         };
     }
-
 }
 
 function createCancellationState(req) {
     const state = {
-        cancelled: false,
-        reason: 'The request was cancelled.'
+        cancelled: false
     };
 
     const markCancelled = () => {
@@ -110,22 +153,75 @@ function createCancellationState(req) {
     return state;
 }
 
-async function sendBulkMessages(users, messageBody, cancellationState) {
+async function sendBulkMessages(users, messageBody, channel, cancellationState) {
+    const channelsToSend = channel === 'both' ? ['sms', 'whatsapp'] : [channel];
 
-    const tasks = users.map(user =>
-        limit(async () => {
-            if (cancellationState.cancelled) {
-                return null;
-            }
+    const tasks = users.flatMap(user =>
+        channelsToSend.map(selectedChannel =>
+            limit(async () => {
+                if (cancellationState.cancelled) {
+                    return null;
+                }
 
-            return sendOne(user, messageBody);
-        })
+                return sendOne(user, messageBody, selectedChannel);
+            })
+        )
     );
 
     const results = await Promise.all(tasks);
-
     return results.filter(Boolean);
 }
+
+function sendJsonError(res, statusCode, message) {
+    return res.status(statusCode).json({ message });
+}
+
+function buildWebhookTwiML() {
+    return '<?xml version="1.0" encoding="UTF-8"?><Response></Response>';
+}
+
+app.get('/health', (_req, res) => {
+    res.status(200).json({
+        status: 'ok'
+    });
+});
+
+app.post('/twilio/incoming', (req, res) => {
+    res.type('xml');
+
+    const from = normalizeContactValue(req.body?.From);
+    const to = normalizeContactValue(req.body?.To);
+    const body = normalizeContactValue(req.body?.Body);
+
+    if (!from || !to || !body) {
+        return res.status(200).send(buildWebhookTwiML());
+    }
+
+    const channel = /^whatsapp:/i.test(from) ? 'whatsapp' : 'sms';
+    const messageSid = normalizeContactValue(req.body?.MessageSid);
+    const smsSid = normalizeContactValue(req.body?.SmsSid);
+    const accountSid = normalizeContactValue(req.body?.AccountSid);
+
+    console.log('Incoming message received');
+    console.log(`Channel: ${channel.toUpperCase()}`);
+    console.log(`From: ${from}`);
+    console.log(`To: ${to}`);
+    console.log(`Body: ${body}`);
+
+    if (messageSid) {
+        console.log(`MessageSid: ${messageSid}`);
+    }
+
+    if (smsSid) {
+        console.log(`SmsSid: ${smsSid}`);
+    }
+
+    if (accountSid) {
+        console.log(`AccountSid: ${accountSid}`);
+    }
+
+    return res.status(200).send(buildWebhookTwiML());
+});
 
 app.get('/', (_req, res) => {
     res.sendFile(path.join(FRONTEND_DIR, 'index.html'));
@@ -134,22 +230,29 @@ app.get('/', (_req, res) => {
 app.post('/send-message', upload.single('file'), async (req, res, next) => {
     try {
         if (!req.file) {
-            return res.status(400).json({
-                message: 'Please upload an Excel file.'
-            });
+            return sendJsonError(res, 400, 'Please upload an Excel file.');
         }
 
         const messageBody = String(req.body.message || DEFAULT_MESSAGE).trim();
+        const channel = normalizeChannel(req.body.channel);
 
         if (!messageBody) {
-            return res.status(400).json({
-                message: 'Message body cannot be empty.'
-            });
+            return sendJsonError(res, 400, 'Message body cannot be empty.');
+        }
+
+        const users = readContactsFromBuffer(req.file.buffer);
+        const invalidContacts = users.filter(user => !user.CONTACT);
+
+        if (invalidContacts.length) {
+            return sendJsonError(
+                res,
+                400,
+                'The uploaded Excel file must include a CONTACT column with values.'
+            );
         }
 
         const cancellationState = createCancellationState(req);
-        const users = readContactsFromBuffer(req.file.buffer);
-        const results = await sendBulkMessages(users, messageBody, cancellationState);
+        const results = await sendBulkMessages(users, messageBody, channel, cancellationState);
 
         if (cancellationState.cancelled) {
             return;
@@ -157,32 +260,64 @@ app.post('/send-message', upload.single('file'), async (req, res, next) => {
 
         const sentCount = results.filter(result => result.sid).length;
         const failedCount = results.length - sentCount;
+        const attemptCount = results.length;
 
-        return res.json({
-            message: `Campaign processed for ${results.length} contact(s).`,
-            total: results.length,
+        return res.status(200).json({
+            message: `Campaign processed for ${attemptCount} delivery attempt(s) using ${channel.toUpperCase()}.`,
+            total: users.length,
+            attempts: attemptCount,
             sent: sentCount,
             failed: failedCount,
+            channel,
             results
         });
     } catch (error) {
         if (error.code === 'ERR_HTTP_REQUEST_ABORTED') {
             return;
         }
+
         next(error);
     }
 });
 
 app.use((error, _req, res, _next) => {
     const statusCode = error.code === 'LIMIT_FILE_SIZE' ? 413 : 500;
+    const message = error.code === 'LIMIT_FILE_SIZE'
+        ? 'The uploaded file is too large.'
+        : (IS_PRODUCTION && statusCode === 500
+            ? 'Something went wrong while processing the request.'
+            : error.message || 'Something went wrong while processing the request.');
 
     res.status(statusCode).json({
-        message: error.code === 'LIMIT_FILE_SIZE'
-            ? 'The uploaded file is too large.'
-            : error.message || 'Something went wrong while processing the request.'
+        message
     });
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
     console.log(`Server listening on port ${PORT}`);
+});
+
+function shutdown(signal) {
+    console.log(`Received ${signal}. Shutting down gracefully.`);
+
+    server.close(() => {
+        process.exit(0);
+    });
+
+    setTimeout(() => {
+        console.error('Forced shutdown after timeout.');
+        process.exit(1);
+    }, 10_000).unref();
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+process.on('unhandledRejection', error => {
+    console.error('Unhandled promise rejection:', error);
+});
+
+process.on('uncaughtException', error => {
+    console.error('Uncaught exception:', error);
+    process.exit(1);
 });

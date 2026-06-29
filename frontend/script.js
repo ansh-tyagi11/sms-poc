@@ -57,7 +57,9 @@ async function sendMessage(e) {
         const data = await response.json();
         status.innerHTML = `
             <p>${data.message}</p>
+            <p>Channel: ${String(data.channel || channel).toUpperCase()}</p>
             <p>Total Contacts: ${data.total}</p>
+            <p>Delivery Attempts: ${data.attempts ?? data.total}</p>
             <p>Messages Sent: ${data.sent}</p>
             <p>Messages Failed: ${data.failed}</p>
         `;
