@@ -21,6 +21,12 @@ const ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || process.env.ACCOUNT_SID;
 const AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || process.env.AUTH_TOKEN;
 const SERVICE_SID = process.env.SERVICE_SID;
 
+const NOTIFY_PHONE_NUMBER = process.env.NOTIFY_PHONE_NUMBER || '';
+const NO_TWO_WAY_SMS_COUNTRIES = new Set(['GH', 'NG', 'ET', 'TZ', 'UG']);
+
+const incomingMessages = [];
+const MAX_STORED_MESSAGES = 500;
+
 if (!ACCOUNT_SID || !AUTH_TOKEN || !SERVICE_SID) {
     throw new Error(
         'Missing required Twilio environment variables. ' +
@@ -45,11 +51,9 @@ app.use(express.static(FRONTEND_DIR, { extensions: ['html'] }));
 
 function normalizeChannel(channel) {
     const normalized = String(channel || 'sms').trim().toLowerCase();
-
     if (!VALID_CHANNELS.has(normalized)) {
         throw new Error('Channel must be one of SMS, WhatsApp, or Both.');
     }
-
     return normalized;
 }
 
@@ -63,26 +67,49 @@ function pickRowValue(row, keys) {
             return row[key];
         }
     }
-
     return '';
+}
+
+function detectCountryCode(phoneNumber) {
+
+    const prefixMap = [
+        { prefix: '+233', code: 'GH' }, // Ghana
+        { prefix: '+234', code: 'NG' }, // Nigeria
+        { prefix: '+251', code: 'ET' }, // Ethiopia
+        { prefix: '+255', code: 'TZ' }, // Tanzania
+        { prefix: '+256', code: 'UG' }, // Uganda
+        { prefix: '+1', code: 'US' }, // USA / Canada
+        { prefix: '+44', code: 'GB' }, // UK
+        { prefix: '+61', code: 'AU' }, // Australia
+        { prefix: '+91', code: 'IN' }, // India
+        { prefix: '+49', code: 'DE' }, // Germany
+        { prefix: '+33', code: 'FR' }, // France
+    ];
+
+    const clean = phoneNumber.replace(/^whatsapp:/i, '');
+    for (const entry of prefixMap) {
+        if (clean.startsWith(entry.prefix)) {
+            return entry.code;
+        }
+    }
+    return 'UNKNOWN';
+}
+
+function isTwoWaySmsSupported(phoneNumber) {
+    const countryCode = detectCountryCode(phoneNumber);
+    return !NO_TWO_WAY_SMS_COUNTRIES.has(countryCode);
 }
 
 function readContactsFromBuffer(buffer) {
     const workbook = XLSX.read(buffer, { type: 'buffer' });
-
     if (!workbook.SheetNames.length) {
         throw new Error('The uploaded Excel file does not contain any sheets.');
     }
-
     const sheetName = workbook.SheetNames[0];
-    const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], {
-        defval: ''
-    });
-
+    const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { defval: '' });
     if (!rows.length) {
         throw new Error('The uploaded Excel sheet does not contain any rows.');
     }
-
     return rows.map(row => ({
         NAME: normalizeContactValue(pickRowValue(row, ['NAME', 'Name', 'name'])) || 'Unknown',
         CONTACT: normalizeContactValue(pickRowValue(row, ['CONTACT', 'Contact', 'contact', 'PHONE', 'Phone', 'phone', 'MOBILE', 'Mobile', 'mobile']))
@@ -92,31 +119,43 @@ function readContactsFromBuffer(buffer) {
 function buildRecipientAddress(rawContact, channel) {
     const contact = normalizeContactValue(rawContact);
     const hasWhatsAppPrefix = /^whatsapp:/i.test(contact);
-
     if (!contact) {
         throw new Error('Contact number is missing.');
     }
-
     if (channel === 'whatsapp') {
         return hasWhatsAppPrefix ? contact : `whatsapp:${contact}`;
     }
-
     return hasWhatsAppPrefix ? contact.replace(/^whatsapp:/i, '') : contact;
+}
+
+function buildWebhookTwiML() {
+    return '<?xml version="1.0" encoding="UTF-8"?><Response></Response>';
+}
+
+function sendJsonError(res, statusCode, message) {
+    return res.status(statusCode).json({ message });
+}
+
+function storeIncomingMessage(data) {
+    incomingMessages.unshift(data);
+    if (incomingMessages.length > MAX_STORED_MESSAGES) {
+        incomingMessages.length = MAX_STORED_MESSAGES;
+    }
 }
 
 async function sendOne(user, messageBody, channel) {
     const name = user.NAME || 'Unknown';
     const rawContact = user.CONTACT;
+    console.log(`Sending message to ${name} (${rawContact}) via ${channel.toUpperCase()}`);
 
     try {
         const recipient = buildRecipientAddress(rawContact, channel);
-
         const message = await client.messages.create({
             body: messageBody,
             messagingServiceSid: SERVICE_SID,
-            to: recipient
+            to: recipient,
+            statusCallback: 'https://sms-poc-t1gc.onrender.com/twilio/status'
         });
-
         return {
             name,
             contact: rawContact,
@@ -125,6 +164,7 @@ async function sendOne(user, messageBody, channel) {
             status: message.status
         };
     } catch (error) {
+        console.error(`Error sending to ${name} (${rawContact}): ${error.message}`);
         return {
             name,
             contact: rawContact,
@@ -135,58 +175,44 @@ async function sendOne(user, messageBody, channel) {
 }
 
 function createCancellationState(req) {
-    const state = {
-        cancelled: false
-    };
-
-    const markCancelled = () => {
-        state.cancelled = true;
-    };
-
+    const state = { cancelled: false };
+    const markCancelled = () => { state.cancelled = true; };
     req.on('aborted', markCancelled);
-    req.on('close', () => {
-        if (!req.complete) {
-            markCancelled();
-        }
-    });
-
+    req.on('close', () => { if (!req.complete) markCancelled(); });
     return state;
 }
 
 async function sendBulkMessages(users, messageBody, channel, cancellationState) {
     const channelsToSend = channel === 'both' ? ['sms', 'whatsapp'] : [channel];
-
     const tasks = users.flatMap(user =>
         channelsToSend.map(selectedChannel =>
             limit(async () => {
-                if (cancellationState.cancelled) {
-                    return null;
-                }
-
+                if (cancellationState.cancelled) return null;
                 return sendOne(user, messageBody, selectedChannel);
             })
         )
     );
-
     const results = await Promise.all(tasks);
+    console.log(
+        `Finished. Attempts: ${results.length}, ` +
+        `Sent: ${results.filter(r => r && r.sid).length}, ` +
+        `Failed: ${results.filter(r => r && r.error).length}`
+    );
     return results.filter(Boolean);
 }
 
-function sendJsonError(res, statusCode, message) {
-    return res.status(statusCode).json({ message });
-}
-
-function buildWebhookTwiML() {
-    return '<?xml version="1.0" encoding="UTF-8"?><Response></Response>';
-}
-
 app.get('/health', (_req, res) => {
+    res.status(200).json({ status: 'ok' });
+});
+
+app.get('/twilio/incoming-messages', (_req, res) => {
     res.status(200).json({
-        status: 'ok'
+        count: incomingMessages.length,
+        messages: incomingMessages
     });
 });
 
-app.post('/twilio/incoming', (req, res) => {
+app.post('/twilio/incoming', async (req, res) => {
     res.type('xml');
 
     const from = normalizeContactValue(req.body?.From);
@@ -201,26 +227,63 @@ app.post('/twilio/incoming', (req, res) => {
     const messageSid = normalizeContactValue(req.body?.MessageSid);
     const smsSid = normalizeContactValue(req.body?.SmsSid);
     const accountSid = normalizeContactValue(req.body?.AccountSid);
+    const countryCode = detectCountryCode(from);
+    const twoWaySupported = isTwoWaySmsSupported(from);
 
     console.log('Incoming message received');
     console.log(`Channel: ${channel.toUpperCase()}`);
-    console.log(`From: ${from}`);
+    console.log(`From: ${from} (Country: ${countryCode})`);
     console.log(`To: ${to}`);
     console.log(`Body: ${body}`);
+    console.log(`Two-way SMS supported: ${twoWaySupported}`);
+    if (messageSid) console.log(`MessageSid: ${messageSid}`);
+    if (smsSid) console.log(`SmsSid: ${smsSid}`);
+    if (accountSid) console.log(`AccountSid: ${accountSid}`);
 
-    if (messageSid) {
-        console.log(`MessageSid: ${messageSid}`);
-    }
+    storeIncomingMessage({
+        receivedAt: new Date().toISOString(),
+        channel,
+        from,
+        to,
+        body,
+        countryCode,
+        twoWaySupported,
+        messageSid,
+        smsSid,
+        accountSid
+    });
 
-    if (smsSid) {
-        console.log(`SmsSid: ${smsSid}`);
-    }
-
-    if (accountSid) {
-        console.log(`AccountSid: ${accountSid}`);
+    if (NOTIFY_PHONE_NUMBER && twoWaySupported) {
+        try {
+            await client.messages.create({
+                body: `Reply from ${from} [${countryCode}] via ${channel.toUpperCase()}: ${body}`,
+                messagingServiceSid: SERVICE_SID,
+                to: NOTIFY_PHONE_NUMBER
+            });
+            console.log(`Reply forwarded to ${NOTIFY_PHONE_NUMBER}`);
+        } catch (err) {
+            console.error(`Failed to forward reply: ${err.message}`);
+        }
+    } else if (NOTIFY_PHONE_NUMBER && !twoWaySupported) {
+        console.log(`Reply from ${countryCode} stored only — two-way SMS not supported. Check /twilio/incoming-messages`);
     }
 
     return res.status(200).send(buildWebhookTwiML());
+});
+
+app.post('/twilio/status', (req, res) => {
+    const messageSid = normalizeContactValue(req.body?.MessageSid);
+    const status = normalizeContactValue(req.body?.MessageStatus);
+    const to = normalizeContactValue(req.body?.To);
+    const errorCode = normalizeContactValue(req.body?.ErrorCode);
+    const errorMessage = normalizeContactValue(req.body?.ErrorMessage);
+
+    console.log(`Status update: ${messageSid} → ${status} (To: ${to})`);
+    if (errorCode) {
+        console.error(`Delivery error ${errorCode}: ${errorMessage} → To: ${to}`);
+    }
+
+    res.sendStatus(200);
 });
 
 app.get('/', (_req, res) => {
@@ -232,36 +295,22 @@ app.post('/send-message', upload.single('file'), async (req, res, next) => {
         if (!req.file) {
             return sendJsonError(res, 400, 'Please upload an Excel file.');
         }
-
         const messageBody = String(req.body.message || DEFAULT_MESSAGE).trim();
         const channel = normalizeChannel(req.body.channel);
-
         if (!messageBody) {
             return sendJsonError(res, 400, 'Message body cannot be empty.');
         }
-
         const users = readContactsFromBuffer(req.file.buffer);
         const invalidContacts = users.filter(user => !user.CONTACT);
-
         if (invalidContacts.length) {
-            return sendJsonError(
-                res,
-                400,
-                'The uploaded Excel file must include a CONTACT column with values.'
-            );
+            return sendJsonError(res, 400, 'The uploaded Excel file must include a CONTACT column with values.');
         }
-
         const cancellationState = createCancellationState(req);
         const results = await sendBulkMessages(users, messageBody, channel, cancellationState);
-
-        if (cancellationState.cancelled) {
-            return;
-        }
-
+        if (cancellationState.cancelled) return;
         const sentCount = results.filter(result => result.sid).length;
         const failedCount = results.length - sentCount;
         const attemptCount = results.length;
-
         return res.status(200).json({
             message: `Campaign processed for ${attemptCount} delivery attempt(s) using ${channel.toUpperCase()}.`,
             total: users.length,
@@ -272,10 +321,7 @@ app.post('/send-message', upload.single('file'), async (req, res, next) => {
             results
         });
     } catch (error) {
-        if (error.code === 'ERR_HTTP_REQUEST_ABORTED') {
-            return;
-        }
-
+        if (error.code === 'ERR_HTTP_REQUEST_ABORTED') return;
         next(error);
     }
 });
@@ -287,10 +333,7 @@ app.use((error, _req, res, _next) => {
         : (IS_PRODUCTION && statusCode === 500
             ? 'Something went wrong while processing the request.'
             : error.message || 'Something went wrong while processing the request.');
-
-    res.status(statusCode).json({
-        message
-    });
+    res.status(statusCode).json({ message });
 });
 
 const server = app.listen(PORT, () => {
@@ -299,11 +342,7 @@ const server = app.listen(PORT, () => {
 
 function shutdown(signal) {
     console.log(`Received ${signal}. Shutting down gracefully.`);
-
-    server.close(() => {
-        process.exit(0);
-    });
-
+    server.close(() => { process.exit(0); });
     setTimeout(() => {
         console.error('Forced shutdown after timeout.');
         process.exit(1);
@@ -312,11 +351,7 @@ function shutdown(signal) {
 
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
-
-process.on('unhandledRejection', error => {
-    console.error('Unhandled promise rejection:', error);
-});
-
+process.on('unhandledRejection', error => { console.error('Unhandled promise rejection:', error); });
 process.on('uncaughtException', error => {
     console.error('Uncaught exception:', error);
     process.exit(1);
