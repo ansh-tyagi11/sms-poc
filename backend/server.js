@@ -21,6 +21,9 @@ const ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || process.env.ACCOUNT_SID;
 const AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || process.env.AUTH_TOKEN;
 const SERVICE_SID = process.env.SERVICE_SID;
 
+const WHATSAPP_360_API_KEY = process.env.WHATSAPP_360_API_KEY;
+const WHATSAPP_360_API_URL = process.env.WHATSAPP_360_API_URL || 'https://waba-v2.360dialog.io';
+
 const NOTIFY_PHONE_NUMBER = process.env.NOTIFY_PHONE_NUMBER || '';
 const NO_TWO_WAY_SMS_COUNTRIES = new Set(['GH', 'NG', 'ET', 'TZ', 'UG']);
 
@@ -31,6 +34,13 @@ if (!ACCOUNT_SID || !AUTH_TOKEN || !SERVICE_SID) {
     throw new Error(
         'Missing required Twilio environment variables. ' +
         'Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and SERVICE_SID.'
+    );
+}
+
+if (!WHATSAPP_360_API_KEY) {
+    console.warn(
+        'WHATSAPP_360_API_KEY is not set. WhatsApp sends and the /webhooks/whatsapp ' +
+        'route will still run, but outbound WhatsApp messages will fail until it is configured.'
     );
 }
 
@@ -116,18 +126,6 @@ function readContactsFromBuffer(buffer) {
     }));
 }
 
-function buildRecipientAddress(rawContact, channel) {
-    const contact = normalizeContactValue(rawContact);
-    const hasWhatsAppPrefix = /^whatsapp:/i.test(contact);
-    if (!contact) {
-        throw new Error('Contact number is missing.');
-    }
-    if (channel === 'whatsapp') {
-        return hasWhatsAppPrefix ? contact : `whatsapp:${contact}`;
-    }
-    return hasWhatsAppPrefix ? contact.replace(/^whatsapp:/i, '') : contact;
-}
-
 function buildWebhookTwiML() {
     return '<?xml version="1.0" encoding="UTF-8"?><Response></Response>';
 }
@@ -143,13 +141,20 @@ function storeIncomingMessage(data) {
     }
 }
 
-async function sendOne(user, messageBody, channel) {
+// ---------------------------------------------------------------------------
+// Outbound sending: SMS -> Twilio, WhatsApp -> 360dialog
+// ---------------------------------------------------------------------------
+
+async function sendViaTwilioSms(user, messageBody) {
     const name = user.NAME || 'Unknown';
     const rawContact = user.CONTACT;
-    console.log(`Sending message to ${name} (${rawContact}) via ${channel.toUpperCase()}`);
+    console.log(`Sending SMS to ${name} (${rawContact}) via Twilio`);
 
     try {
-        const recipient = buildRecipientAddress(rawContact, channel);
+        const recipient = normalizeContactValue(rawContact).replace(/^whatsapp:/i, '');
+        if (!recipient) {
+            throw new Error('Contact number is missing.');
+        }
         const message = await client.messages.create({
             body: messageBody,
             messagingServiceSid: SERVICE_SID,
@@ -159,19 +164,86 @@ async function sendOne(user, messageBody, channel) {
         return {
             name,
             contact: rawContact,
-            channel,
+            channel: 'sms',
             sid: message.sid,
             status: message.status
         };
     } catch (error) {
-        console.error(`Error sending to ${name} (${rawContact}): ${error.message}`);
+        console.error(`Error sending SMS to ${name} (${rawContact}): ${error.message}`);
         return {
             name,
             contact: rawContact,
-            channel,
+            channel: 'sms',
             error: error.message
         };
     }
+}
+
+function to360WhatsAppNumber(rawContact) {
+    const cleaned = normalizeContactValue(rawContact).replace(/^whatsapp:/i, '');
+    const digitsOnly = cleaned.replace(/[^\d]/g, '');
+    if (!digitsOnly) {
+        throw new Error('Contact number is missing or invalid.');
+    }
+    return digitsOnly;
+}
+
+async function sendViaWhatsApp360(user, messageBody) {
+    const name = user.NAME || 'Unknown';
+    const rawContact = user.CONTACT;
+    console.log(`Sending WhatsApp to ${name} (${rawContact}) via 360dialog`);
+
+    try {
+        if (!WHATSAPP_360_API_KEY) {
+            throw new Error('360dialog API key is not configured (set WHATSAPP_360_API_KEY).');
+        }
+        const to = to360WhatsAppNumber(rawContact);
+        const response = await fetch(`${WHATSAPP_360_API_URL}/messages`, {
+            method: 'POST',
+            headers: {
+                'D360-API-KEY': WHATSAPP_360_API_KEY,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                messaging_product: 'whatsapp',
+                to,
+                type: 'text',
+                text: { body: messageBody }
+            })
+        });
+
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            const errMsg = data?.error?.message
+                || data?.errors?.[0]?.title
+                || `360dialog request failed with status ${response.status}`;
+            throw new Error(errMsg);
+        }
+
+        const messageId = data?.messages?.[0]?.id || null;
+        return {
+            name,
+            contact: rawContact,
+            channel: 'whatsapp',
+            sid: messageId,
+            status: 'accepted'
+        };
+    } catch (error) {
+        console.error(`Error sending WhatsApp to ${name} (${rawContact}): ${error.message}`);
+        return {
+            name,
+            contact: rawContact,
+            channel: 'whatsapp',
+            error: error.message
+        };
+    }
+}
+
+async function sendOne(user, messageBody, channel) {
+    if (channel === 'whatsapp') {
+        return sendViaWhatsApp360(user, messageBody);
+    }
+    return sendViaTwilioSms(user, messageBody);
 }
 
 function createCancellationState(req) {
@@ -223,15 +295,14 @@ app.post('/twilio/incoming', async (req, res) => {
         return res.status(200).send(buildWebhookTwiML());
     }
 
-    const channel = /^whatsapp:/i.test(from) ? 'whatsapp' : 'sms';
+    const channel = 'sms';
     const messageSid = normalizeContactValue(req.body?.MessageSid);
     const smsSid = normalizeContactValue(req.body?.SmsSid);
     const accountSid = normalizeContactValue(req.body?.AccountSid);
     const countryCode = detectCountryCode(from);
     const twoWaySupported = isTwoWaySmsSupported(from);
 
-    console.log('Incoming message received');
-    console.log(`Channel: ${channel.toUpperCase()}`);
+    console.log('Incoming SMS message received');
     console.log(`From: ${from} (Country: ${countryCode})`);
     console.log(`To: ${to}`);
     console.log(`Body: ${body}`);
@@ -256,7 +327,7 @@ app.post('/twilio/incoming', async (req, res) => {
     if (NOTIFY_PHONE_NUMBER && twoWaySupported) {
         try {
             await client.messages.create({
-                body: `Reply from ${from} [${countryCode}] via ${channel.toUpperCase()}: ${body}`,
+                body: `Reply from ${from} [${countryCode}] via SMS: ${body}`,
                 messagingServiceSid: SERVICE_SID,
                 to: NOTIFY_PHONE_NUMBER
             });
@@ -269,6 +340,67 @@ app.post('/twilio/incoming', async (req, res) => {
     }
 
     return res.status(200).send(buildWebhookTwiML());
+});
+
+app.post('/webhooks/whatsapp', async (req, res) => {
+    res.sendStatus(200);
+
+    try {
+        const entries = req.body?.entry || [];
+        for (const entry of entries) {
+            const changes = entry?.changes || [];
+            for (const change of changes) {
+                const value = change?.value;
+                const messages = value?.messages || [];
+                const contacts = value?.contacts || [];
+
+                for (const msg of messages) {
+                    const from = normalizeContactValue(msg?.from);
+                    const body = normalizeContactValue(msg?.text?.body);
+                    const messageId = normalizeContactValue(msg?.id);
+                    const contactName = contacts.find(c => c?.wa_id === msg?.from)?.profile?.name || '';
+                    const fromWithPrefix = `whatsapp:+${from}`;
+                    const countryCode = detectCountryCode(fromWithPrefix);
+                    const twoWaySupported = isTwoWaySmsSupported(fromWithPrefix);
+
+                    console.log('Incoming WhatsApp message received (360dialog)');
+                    console.log(`From: ${from} (${contactName}) [${countryCode}]`);
+                    console.log(`Body: ${body}`);
+                    if (messageId) console.log(`MessageId: ${messageId}`);
+
+                    storeIncomingMessage({
+                        receivedAt: new Date().toISOString(),
+                        channel: 'whatsapp',
+                        from: fromWithPrefix,
+                        to: normalizeContactValue(value?.metadata?.display_phone_number),
+                        body,
+                        countryCode,
+                        twoWaySupported,
+                        messageSid: messageId,
+                        smsSid: '',
+                        accountSid: ''
+                    });
+
+                    if (NOTIFY_PHONE_NUMBER && twoWaySupported) {
+                        try {
+                            await client.messages.create({
+                                body: `WhatsApp reply from ${contactName || from} [${countryCode}]: ${body}`,
+                                messagingServiceSid: SERVICE_SID,
+                                to: NOTIFY_PHONE_NUMBER
+                            });
+                            console.log(`WhatsApp reply forwarded to ${NOTIFY_PHONE_NUMBER}`);
+                        } catch (err) {
+                            console.error(`Failed to forward WhatsApp reply: ${err.message}`);
+                        }
+                    } else if (NOTIFY_PHONE_NUMBER && !twoWaySupported) {
+                        console.log(`WhatsApp reply from ${countryCode} stored only — check /twilio/incoming-messages`);
+                    }
+                }
+            }
+        }
+    } catch (error) {
+        console.error('Error processing 360dialog webhook payload:', error.message);
+    }
 });
 
 app.post('/twilio/status', (req, res) => {
