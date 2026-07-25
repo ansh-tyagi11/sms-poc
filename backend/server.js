@@ -24,6 +24,12 @@ const SERVICE_SID = process.env.SERVICE_SID;
 const WHATSAPP_360_API_KEY = process.env.WHATSAPP_360_API_KEY;
 const WHATSAPP_360_API_URL = process.env.WHATSAPP_360_API_URL || 'https://waba-v2.360dialog.io';
 
+const SMSALA_API_ID = process.env.SMSALA_API_ID;
+const SMSALA_API_PASSWORD = process.env.SMSALA_API_PASSWORD;
+const SMSALA_SENDER_ID = process.env.SMSALA_SENDER_ID || 'SMSALA';
+const SMSALA_API_URL = process.env.SMSALA_API_URL || 'https://api.smsala.com/api/SendSMS';
+const SMSALA_COUNTRIES = new Set(['GH']); // Ghana only routes through SMSala; everything else uses Twilio
+
 const NOTIFY_PHONE_NUMBER = process.env.NOTIFY_PHONE_NUMBER || '';
 const NO_TWO_WAY_SMS_COUNTRIES = new Set(['GH', 'NG', 'ET', 'TZ', 'UG']);
 
@@ -41,6 +47,13 @@ if (!WHATSAPP_360_API_KEY) {
     console.warn(
         'WHATSAPP_360_API_KEY is not set. WhatsApp sends and the /webhooks/whatsapp ' +
         'route will still run, but outbound WhatsApp messages will fail until it is configured.'
+    );
+}
+
+if (!SMSALA_API_ID || !SMSALA_API_PASSWORD) {
+    console.warn(
+        'SMSALA_API_ID / SMSALA_API_PASSWORD is not set. Ghana SMS sends will fail ' +
+        'until these are configured (Ghana traffic will not fall back to Twilio automatically).'
     );
 }
 
@@ -142,7 +155,7 @@ function storeIncomingMessage(data) {
 }
 
 // ---------------------------------------------------------------------------
-// Outbound sending: SMS -> Twilio, WhatsApp -> 360dialog
+// Outbound sending: SMS -> Twilio (or SMSala for Ghana), WhatsApp -> 360dialog
 // ---------------------------------------------------------------------------
 
 async function sendViaTwilioSms(user, messageBody) {
@@ -170,6 +183,63 @@ async function sendViaTwilioSms(user, messageBody) {
         };
     } catch (error) {
         console.error(`Error sending SMS to ${name} (${rawContact}): ${error.message}`);
+        return {
+            name,
+            contact: rawContact,
+            channel: 'sms',
+            error: error.message
+        };
+    }
+}
+
+function toSmsalaNumber(rawContact) {
+    const cleaned = normalizeContactValue(rawContact).replace(/^whatsapp:/i, '');
+    const digitsOnly = cleaned.replace(/[^\d]/g, '');
+    if (!digitsOnly) {
+        throw new Error('Contact number is missing or invalid.');
+    }
+    return digitsOnly;
+}
+
+async function sendViaSmsala(user, messageBody) {
+    const name = user.NAME || 'Unknown';
+    const rawContact = user.CONTACT;
+    console.log(`Sending SMS to ${name} (${rawContact}) via SMSala (Ghana)`);
+
+    try {
+        if (!SMSALA_API_ID || !SMSALA_API_PASSWORD) {
+            throw new Error('SMSala API credentials are not configured (set SMSALA_API_ID / SMSALA_API_PASSWORD).');
+        }
+        const phonenumber = toSmsalaNumber(rawContact);
+        const params = new URLSearchParams({
+            api_id: SMSALA_API_ID,
+            api_password: SMSALA_API_PASSWORD,
+            sms_type: 'T',
+            encoding: 'T',
+            sender_id: SMSALA_SENDER_ID,
+            phonenumber,
+            textmessage: messageBody
+        });
+
+        const response = await fetch(`${SMSALA_API_URL}?${params.toString()}`, {
+            method: 'GET'
+        });
+
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || data.status !== 'S') {
+            const errMsg = data?.remarks || `SMSala request failed with status ${response.status}`;
+            throw new Error(errMsg);
+        }
+
+        return {
+            name,
+            contact: rawContact,
+            channel: 'sms',
+            sid: data.message_id ? String(data.message_id) : null,
+            status: 'submitted'
+        };
+    } catch (error) {
+        console.error(`Error sending SMS to ${name} (${rawContact}) via SMSala: ${error.message}`);
         return {
             name,
             contact: rawContact,
@@ -242,6 +312,11 @@ async function sendViaWhatsApp360(user, messageBody) {
 async function sendOne(user, messageBody, channel) {
     if (channel === 'whatsapp') {
         return sendViaWhatsApp360(user, messageBody);
+    }
+    // SMS: route Ghana through SMSala, everything else through Twilio
+    const countryCode = detectCountryCode(normalizeContactValue(user.CONTACT));
+    if (SMSALA_COUNTRIES.has(countryCode)) {
+        return sendViaSmsala(user, messageBody);
     }
     return sendViaTwilioSms(user, messageBody);
 }
