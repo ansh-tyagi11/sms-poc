@@ -24,11 +24,14 @@ const SERVICE_SID = process.env.SERVICE_SID;
 const WHATSAPP_360_API_KEY = process.env.WHATSAPP_360_API_KEY;
 const WHATSAPP_360_API_URL = process.env.WHATSAPP_360_API_URL || 'https://waba-v2.360dialog.io';
 
-const SMSALA_API_ID = process.env.SMSALA_API_ID;
-const SMSALA_API_PASSWORD = process.env.SMSALA_API_PASSWORD;
-const SMSALA_SENDER_ID = process.env.SMSALA_SENDER_ID || 'SMSALA';
-const SMSALA_API_URL = process.env.SMSALA_API_URL || 'https://api.smsala.com/api/SendSMS';
-const SMSALA_COUNTRIES = new Set(['GH']); // Ghana only routes through SMSala; everything else uses Twilio
+const SMSALA_API_TOKEN = process.env.SMSALA_API_TOKEN;
+const SMSALA_SENDER_ID = process.env.SMSALA_SENDER_ID || 'TSTALA';
+const SMSALA_API_URL = process.env.SMSALA_API_URL || 'https://api2.smsala.com/SendSmsV2';
+
+const SMSALA_MESSAGE_TYPE = process.env.SMSALA_MESSAGE_TYPE || '1';
+
+const SMSALA_MESSAGE_ENCODING = process.env.SMSALA_MESSAGE_ENCODING || '1';
+const SMSALA_COUNTRIES = new Set(['GH']);
 
 const NOTIFY_PHONE_NUMBER = process.env.NOTIFY_PHONE_NUMBER || '';
 const NO_TWO_WAY_SMS_COUNTRIES = new Set(['GH', 'NG', 'ET', 'TZ', 'UG']);
@@ -50,10 +53,10 @@ if (!WHATSAPP_360_API_KEY) {
     );
 }
 
-if (!SMSALA_API_ID || !SMSALA_API_PASSWORD) {
+if (!SMSALA_API_TOKEN) {
     console.warn(
-        'SMSALA_API_ID / SMSALA_API_PASSWORD is not set. Ghana SMS sends will fail ' +
-        'until these are configured (Ghana traffic will not fall back to Twilio automatically).'
+        'SMSALA_API_TOKEN is not set. Ghana SMS sends will fail ' +
+        'until this is configured (Ghana traffic will not fall back to Twilio automatically).'
     );
 }
 
@@ -207,18 +210,17 @@ async function sendViaSmsala(user, messageBody) {
     console.log(`Sending SMS to ${name} (${rawContact}) via SMSala (Ghana)`);
 
     try {
-        if (!SMSALA_API_ID || !SMSALA_API_PASSWORD) {
-            throw new Error('SMSala API credentials are not configured (set SMSALA_API_ID / SMSALA_API_PASSWORD).');
+        if (!SMSALA_API_TOKEN) {
+            throw new Error('SMSala API credentials are not configured (set SMSALA_API_TOKEN).');
         }
-        const phonenumber = toSmsalaNumber(rawContact);
+        const destinationAddress = toSmsalaNumber(rawContact);
         const params = new URLSearchParams({
-            api_id: SMSALA_API_ID,
-            api_password: SMSALA_API_PASSWORD,
-            sms_type: 'T',
-            encoding: 'T',
-            sender_id: SMSALA_SENDER_ID,
-            phonenumber,
-            textmessage: messageBody
+            apiToken: SMSALA_API_TOKEN,
+            messageType: SMSALA_MESSAGE_TYPE,
+            messageEncoding: SMSALA_MESSAGE_ENCODING,
+            destinationAddress,
+            sourceAddress: SMSALA_SENDER_ID,
+            messageText: messageBody
         });
 
         const response = await fetch(`${SMSALA_API_URL}?${params.toString()}`, {
@@ -226,8 +228,12 @@ async function sendViaSmsala(user, messageBody) {
         });
 
         const data = await response.json().catch(() => ({}));
-        if (!response.ok || data.status !== 'S') {
-            const errMsg = data?.remarks || `SMSala request failed with status ${response.status}`;
+        // The documented API returns an array of result objects (PascalCase fields),
+        // even for a single recipient.
+        const result = Array.isArray(data) ? data[0] : data;
+
+        if (!response.ok || !result || result.Status !== 'Success') {
+            const errMsg = result?.Remarks || `SMSala request failed with status ${response.status}`;
             throw new Error(errMsg);
         }
 
@@ -235,7 +241,7 @@ async function sendViaSmsala(user, messageBody) {
             name,
             contact: rawContact,
             channel: 'sms',
-            sid: data.message_id ? String(data.message_id) : null,
+            sid: result.MessageId != null ? String(result.MessageId) : null,
             status: 'submitted'
         };
     } catch (error) {
