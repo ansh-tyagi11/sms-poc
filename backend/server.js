@@ -358,6 +358,12 @@ app.get('/health', (_req, res) => {
     res.status(200).json({ status: 'ok' });
 });
 
+app.get("/ip", async (req, res) => {
+    const response = await fetch("https://api.ipify.org?format=json");
+    const data = await response.json();
+    res.json(data);
+});
+
 app.get('/twilio/incoming-messages', (_req, res) => {
     res.status(200).json({
         count: incomingMessages.length,
