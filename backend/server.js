@@ -33,11 +33,21 @@ const SMSALA_MESSAGE_TYPE = process.env.SMSALA_MESSAGE_TYPE || '1';
 const SMSALA_MESSAGE_ENCODING = process.env.SMSALA_MESSAGE_ENCODING || '1';
 const SMSALA_COUNTRIES = new Set(['GH']);
 
+// SMSala delivery-report callback: SMSala will POST (or GET, depending on their
+// setup) status updates to this URL once a message's delivery status changes.
+const SMSALA_CALLBACK_URL = process.env.SMSALA_CALLBACK_URL
+    || 'https://sms-poc-t1gc.onrender.com/smsala/status';
+
 const NOTIFY_PHONE_NUMBER = process.env.NOTIFY_PHONE_NUMBER || '';
 const NO_TWO_WAY_SMS_COUNTRIES = new Set(['GH', 'NG', 'ET', 'TZ', 'UG']);
 
 const incomingMessages = [];
 const MAX_STORED_MESSAGES = 500;
+
+// SMSala delivery-report callbacks get stored here so they can be inspected
+// via /smsala/status-log, similar to how incoming messages are tracked.
+const smsalaStatusUpdates = [];
+const MAX_STORED_STATUS_UPDATES = 500;
 
 if (!ACCOUNT_SID || !AUTH_TOKEN || !SERVICE_SID) {
     throw new Error(
@@ -157,6 +167,13 @@ function storeIncomingMessage(data) {
     }
 }
 
+function storeSmsalaStatusUpdate(data) {
+    smsalaStatusUpdates.unshift(data);
+    if (smsalaStatusUpdates.length > MAX_STORED_STATUS_UPDATES) {
+        smsalaStatusUpdates.length = MAX_STORED_STATUS_UPDATES;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Outbound sending: SMS -> Twilio (or SMSala for Ghana), WhatsApp -> 360dialog
 // ---------------------------------------------------------------------------
@@ -214,20 +231,32 @@ async function sendViaSmsala(user, messageBody) {
             throw new Error('SMSala API credentials are not configured (set SMSALA_API_TOKEN).');
         }
         const destinationAddress = toSmsalaNumber(rawContact);
+        // A per-message reference lets us match this send to its later DLR callback.
+        const userReferenceId = `${Date.now()}-${destinationAddress}`;
         const params = new URLSearchParams({
             apiToken: SMSALA_API_TOKEN,
             messageType: SMSALA_MESSAGE_TYPE,
             messageEncoding: SMSALA_MESSAGE_ENCODING,
             destinationAddress,
             sourceAddress: SMSALA_SENDER_ID,
-            messageText: messageBody
+            messageText: messageBody,
+            callBackUrl: SMSALA_CALLBACK_URL,
+            userReferenceId
         });
-
+        console.log("API Token:", SMSALA_API_TOKEN.substring(0, 10) + "...");
+        const response1 = await fetch("https://api.ipify.org?format=json");
+        const data1 = await response1.json();
+        console.log("Ip" + data1.ip);
         const response = await fetch(`${SMSALA_API_URL}?${params.toString()}`, {
             method: 'GET'
         });
 
+
         const data = await response.json().catch(() => ({}));
+
+        console.log("HTTP Status:", response.status);
+        console.log("SMSala Response:");
+        console.log(JSON.stringify(data, null, 2));
         // The documented API returns an array of result objects (PascalCase fields),
         // even for a single recipient.
         const result = Array.isArray(data) ? data[0] : data;
@@ -242,7 +271,8 @@ async function sendViaSmsala(user, messageBody) {
             contact: rawContact,
             channel: 'sms',
             sid: result.MessageId != null ? String(result.MessageId) : null,
-            status: 'submitted'
+            status: 'submitted',
+            userReferenceId
         };
     } catch (error) {
         console.error(`Error sending SMS to ${name} (${rawContact}) via SMSala: ${error.message}`);
@@ -503,6 +533,50 @@ app.post('/twilio/status', (req, res) => {
     }
 
     res.sendStatus(200);
+});
+
+// ---------------------------------------------------------------------------
+// SMSala delivery-report (DLR) callback
+// SMSala calls this URL (configured via the callBackUrl param on send) once a
+// message's delivery status is known. Handling both POST and GET here since
+// gateways vary in how they invoke DLR webhooks.
+// ---------------------------------------------------------------------------
+
+function handleSmsalaStatusPayload(payload, method) {
+    const messageId = normalizeContactValue(payload?.MessageId ?? payload?.messageId);
+    const dlrStatus = normalizeContactValue(payload?.DlrStatus ?? payload?.dlrStatus);
+    const destinationAddress = normalizeContactValue(payload?.DestinationAddress ?? payload?.destinationAddress);
+    const userReferenceId = normalizeContactValue(payload?.UserReferenceId ?? payload?.userReferenceId);
+
+    console.log(`SMSala DLR callback received (${method}):`, JSON.stringify(payload, null, 2));
+    console.log(`SMSala status: MessageId=${messageId} → ${dlrStatus} (To: ${destinationAddress})`);
+
+    storeSmsalaStatusUpdate({
+        receivedAt: new Date().toISOString(),
+        method,
+        messageId,
+        dlrStatus,
+        destinationAddress,
+        userReferenceId,
+        raw: payload
+    });
+}
+
+app.post('/smsala/status', (req, res) => {
+    handleSmsalaStatusPayload(req.body, 'POST');
+    res.sendStatus(200);
+});
+
+app.get('/smsala/status', (req, res) => {
+    handleSmsalaStatusPayload(req.query, 'GET');
+    res.sendStatus(200);
+});
+
+app.get('/smsala/status-log', (_req, res) => {
+    res.status(200).json({
+        count: smsalaStatusUpdates.length,
+        updates: smsalaStatusUpdates
+    });
 });
 
 app.get('/', (_req, res) => {
