@@ -38,6 +38,10 @@ const SMSALA_COUNTRIES = new Set(['GH']);
 const SMSALA_CALLBACK_URL = process.env.SMSALA_CALLBACK_URL
     || 'https://sms-poc-t1gc.onrender.com/smsala/status';
 
+// Max recipients per single SMSala batch call (comma-separated destinationAddress).
+// SMSala's docs don't state a hard cap; 100 is a conservative default.
+const SMSALA_BATCH_SIZE = Number(process.env.SMSALA_BATCH_SIZE) || 100;
+
 const NOTIFY_PHONE_NUMBER = process.env.NOTIFY_PHONE_NUMBER || '';
 const NO_TWO_WAY_SMS_COUNTRIES = new Set(['GH', 'NG', 'ET', 'TZ', 'UG']);
 
@@ -221,18 +225,51 @@ function toSmsalaNumber(rawContact) {
     return digitsOnly;
 }
 
-async function sendViaSmsala(user, messageBody) {
-    const name = user.NAME || 'Unknown';
-    const rawContact = user.CONTACT;
-    console.log(`Sending SMS to ${name} (${rawContact}) via SMSala (Ghana)`);
+function chunkArray(array, size) {
+    const chunks = [];
+    for (let i = 0; i < array.length; i += size) {
+        chunks.push(array.slice(i, i + size));
+    }
+    return chunks;
+}
 
-    try {
-        if (!SMSALA_API_TOKEN) {
-            throw new Error('SMSala API credentials are not configured (set SMSALA_API_TOKEN).');
+// Sends to a batch of Ghana recipients in ONE SMSala API call, using the
+// documented comma-separated destinationAddress format:
+//   destinationAddress=233...,233...,233...
+// SMSala returns an array of result objects in the same order as the
+// destinationAddress list, which we zip back to the original users.
+async function sendViaSmsalaBatch(users, messageBody) {
+    if (!SMSALA_API_TOKEN) {
+        return users.map(user => ({
+            name: user.NAME || 'Unknown',
+            contact: user.CONTACT,
+            channel: 'sms',
+            error: 'SMSala API credentials are not configured (set SMSALA_API_TOKEN).'
+        }));
+    }
+
+    const results = [];
+
+    for (const batch of chunkArray(users, SMSALA_BATCH_SIZE)) {
+        const validEntries = [];
+        for (const user of batch) {
+            try {
+                const destination = toSmsalaNumber(user.CONTACT);
+                validEntries.push({ user, destination });
+            } catch (error) {
+                results.push({
+                    name: user.NAME || 'Unknown',
+                    contact: user.CONTACT,
+                    channel: 'sms',
+                    error: error.message
+                });
+            }
         }
-        const destinationAddress = toSmsalaNumber(rawContact);
-        // A per-message reference lets us match this send to its later DLR callback.
-        const userReferenceId = `${Date.now()}-${destinationAddress}`;
+
+        if (!validEntries.length) continue;
+
+        const destinationAddress = validEntries.map(e => e.destination).join(',');
+        const userReferenceId = `${Date.now()}-batch`;
         const params = new URLSearchParams({
             apiToken: SMSALA_API_TOKEN,
             messageType: SMSALA_MESSAGE_TYPE,
@@ -243,46 +280,56 @@ async function sendViaSmsala(user, messageBody) {
             callBackUrl: SMSALA_CALLBACK_URL,
             userReferenceId
         });
-        console.log("API Token:", SMSALA_API_TOKEN.substring(0, 10) + "...");
-        const response1 = await fetch("https://api.ipify.org?format=json");
-        const data1 = await response1.json();
-        console.log("Ip" + data1.ip);
-        const response = await fetch(`${SMSALA_API_URL}?${params.toString()}`, {
-            method: 'GET'
-        });
 
+        console.log(`Sending SMSala batch of ${validEntries.length} recipient(s) via SMSala (Ghana)`);
 
-        const data = await response.json().catch(() => ({}));
+        try {
+            const response = await fetch(`${SMSALA_API_URL}?${params.toString()}`, { method: 'GET' });
+            const data = await response.json().catch(() => ({}));
 
-        console.log("HTTP Status:", response.status);
-        console.log("SMSala Response:");
-        console.log(JSON.stringify(data, null, 2));
-        // The documented API returns an array of result objects (PascalCase fields),
-        // even for a single recipient.
-        const result = Array.isArray(data) ? data[0] : data;
+            console.log("HTTP Status:", response.status);
+            console.log("SMSala Response:");
+            console.log(JSON.stringify(data, null, 2));
 
-        if (!response.ok || !result || result.Status !== 'Success') {
-            const errMsg = result?.Remarks || `SMSala request failed with status ${response.status}`;
-            throw new Error(errMsg);
+            const resultList = Array.isArray(data) ? data : [data];
+
+            validEntries.forEach((entry, index) => {
+                const result = resultList[index];
+                const name = entry.user.NAME || 'Unknown';
+                if (!response.ok || !result || result.Status !== 'Success') {
+                    const errMsg = result?.Remarks || `SMSala request failed with status ${response.status}`;
+                    console.error(`Error sending SMS to ${name} (${entry.user.CONTACT}) via SMSala: ${errMsg}`);
+                    results.push({
+                        name,
+                        contact: entry.user.CONTACT,
+                        channel: 'sms',
+                        error: errMsg
+                    });
+                } else {
+                    results.push({
+                        name,
+                        contact: entry.user.CONTACT,
+                        channel: 'sms',
+                        sid: result.MessageId != null ? String(result.MessageId) : null,
+                        status: 'submitted',
+                        userReferenceId
+                    });
+                }
+            });
+        } catch (error) {
+            console.error(`SMSala batch request failed: ${error.message}`);
+            for (const entry of validEntries) {
+                results.push({
+                    name: entry.user.NAME || 'Unknown',
+                    contact: entry.user.CONTACT,
+                    channel: 'sms',
+                    error: error.message
+                });
+            }
         }
-
-        return {
-            name,
-            contact: rawContact,
-            channel: 'sms',
-            sid: result.MessageId != null ? String(result.MessageId) : null,
-            status: 'submitted',
-            userReferenceId
-        };
-    } catch (error) {
-        console.error(`Error sending SMS to ${name} (${rawContact}) via SMSala: ${error.message}`);
-        return {
-            name,
-            contact: rawContact,
-            channel: 'sms',
-            error: error.message
-        };
     }
+
+    return results;
 }
 
 function to360WhatsAppNumber(rawContact) {
@@ -345,18 +392,6 @@ async function sendViaWhatsApp360(user, messageBody) {
     }
 }
 
-async function sendOne(user, messageBody, channel) {
-    if (channel === 'whatsapp') {
-        return sendViaWhatsApp360(user, messageBody);
-    }
-    // SMS: route Ghana through SMSala, everything else through Twilio
-    const countryCode = detectCountryCode(normalizeContactValue(user.CONTACT));
-    if (SMSALA_COUNTRIES.has(countryCode)) {
-        return sendViaSmsala(user, messageBody);
-    }
-    return sendViaTwilioSms(user, messageBody);
-}
-
 function createCancellationState(req) {
     const state = { cancelled: false };
     const markCancelled = () => { state.cancelled = true; };
@@ -365,17 +400,48 @@ function createCancellationState(req) {
     return state;
 }
 
+// SMS is split: Ghana recipients go out in batched SMSala calls (one HTTP
+// request per up-to-SMSALA_BATCH_SIZE numbers); everyone else goes through
+// Twilio per-recipient, same as before. WhatsApp stays per-recipient via
+// 360dialog, since that API doesn't support a comma-separated multi-send.
 async function sendBulkMessages(users, messageBody, channel, cancellationState) {
     const channelsToSend = channel === 'both' ? ['sms', 'whatsapp'] : [channel];
-    const tasks = users.flatMap(user =>
-        channelsToSend.map(selectedChannel =>
-            limit(async () => {
-                if (cancellationState.cancelled) return null;
-                return sendOne(user, messageBody, selectedChannel);
-            })
-        )
-    );
-    const results = await Promise.all(tasks);
+    const results = [];
+
+    for (const selectedChannel of channelsToSend) {
+        if (cancellationState.cancelled) break;
+
+        if (selectedChannel === 'sms') {
+            const ghanaUsers = [];
+            const otherUsers = [];
+            for (const user of users) {
+                const countryCode = detectCountryCode(normalizeContactValue(user.CONTACT));
+                (SMSALA_COUNTRIES.has(countryCode) ? ghanaUsers : otherUsers).push(user);
+            }
+
+            if (ghanaUsers.length && !cancellationState.cancelled) {
+                const batchResults = await sendViaSmsalaBatch(ghanaUsers, messageBody);
+                results.push(...batchResults);
+            }
+
+            const twilioTasks = otherUsers.map(user =>
+                limit(async () => {
+                    if (cancellationState.cancelled) return null;
+                    return sendViaTwilioSms(user, messageBody);
+                })
+            );
+            results.push(...(await Promise.all(twilioTasks)).filter(Boolean));
+        } else {
+            const waTasks = users.map(user =>
+                limit(async () => {
+                    if (cancellationState.cancelled) return null;
+                    return sendViaWhatsApp360(user, messageBody);
+                })
+            );
+            results.push(...(await Promise.all(waTasks)).filter(Boolean));
+        }
+    }
+
     console.log(
         `Finished. Attempts: ${results.length}, ` +
         `Sent: ${results.filter(r => r && r.sid).length}, ` +
